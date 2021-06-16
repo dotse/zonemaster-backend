@@ -11,6 +11,7 @@ use Digest::MD5 qw(md5_hex);
 use Encode;
 use JSON::PP;
 use Log::Any qw( $log );
+use POSIX qw( strftime );
 
 use Zonemaster::Backend::Config;
 
@@ -165,7 +166,21 @@ sub create_new_batch_job {
 
     die "You can't create a new batch job, job:[$batch_id] started on:[$creaton_time] still running \n" if ( $batch_id );
 
-    $self->dbh->do("INSERT INTO batch_jobs (username) VALUES(" . $self->dbh->quote( $username ) . ")" );
+    my $now_string = _format_time( time );
+    $self->dbh->do( "
+        INSERT INTO batch_jobs (
+            username,
+            creation_time,
+            test_start_time,
+            test_end_time
+        ) VALUES (?,?,?,?)
+        ",
+        undef,
+        $username,
+        $now_string,
+        $now_string,
+        $now_string,
+    );
     my ( $new_batch_id ) = $self->dbh->sqlite_last_insert_rowid;
 
     return $new_batch_id;
@@ -183,15 +198,20 @@ sub create_new_test {
     my $result_id;
 
     my $priority = $test_params->{priority};
-    my $queue = $test_params->{queue};
+    my $queue    = $test_params->{queue};
+    my $now      = time;
 
     # Search for recent test result with the test same parameters, where "$seconds"
     # gives the time limit for how old test result that is accepted.
-    my ( $recent_hash_id ) = $dbh->selectrow_array(
-        "SELECT hash_id FROM test_results WHERE params_deterministic_hash = ? AND test_start_time > DATETIME('now', ?)",
+    my ( $recent_hash_id ) = $dbh->selectrow_array( "
+        SELECT hash_id
+        FROM test_results
+        WHERE params_deterministic_hash = ?
+          AND test_start_time >= ?
+        ",
         undef,
         $test_params_deterministic_hash,
-        "-$seconds seconds"
+        _format_time( $now - $seconds ),
     );
 
     if ( $recent_hash_id ) {
@@ -205,18 +225,34 @@ sub create_new_test {
         # cannot, however, be guaranteed. Same as with the other database engines.
         my $hash_id = substr(md5_hex(time().rand()), 0, 16);
 
-        my $fields = 'hash_id, batch_id, priority, queue, params_deterministic_hash, params, domain, test_start_time, undelegated';
+        my $now_string = _format_time( $now );
+
         $dbh->do(
-            "INSERT INTO test_results ($fields) VALUES (?,?,?,?,?,?,?, datetime('now'),?)",
+            "INSERT INTO test_results (
+                hash_id,
+                batch_id,
+                creation_time,
+                test_start_time,
+                test_end_time,
+                priority,
+                queue,
+                params_deterministic_hash,
+                params,
+                domain,
+                undelegated
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             undef,
             $hash_id,
             $batch_id,
+            $now_string,
+            $now_string,
+            $now_string,
             $priority,
             $queue,
             $test_params_deterministic_hash,
             $encoded_params,
             $test_params->{domain},
-            ($test_params->{nameservers})?(1):(0),
+            $test_params->{nameservers} ? 1 : 0,
         );
         $result_id = $hash_id;
     }
@@ -229,11 +265,31 @@ sub test_progress {
 
     my $dbh = $self->dbh;
     if ( $progress ) {
-        if ($progress == 1) {
-            $dbh->do( "UPDATE test_results SET progress=?, test_start_time=datetime('now') WHERE hash_id=? AND progress <> 100", undef, $progress, $test_id );
+        if ( $progress == 1 ) {
+            $dbh->do( "
+                UPDATE test_results
+                SET progress = ?,
+                    test_start_time = datetime(?)
+                WHERE hash_id = ?
+                  AND progress <> 100
+                ",
+                undef,
+                $progress,
+                _format_time( time ),
+                $test_id,
+            );
         }
         else {
-            $dbh->do( "UPDATE test_results SET progress=? WHERE hash_id=? AND progress <> 100", undef, $progress, $test_id );
+            $dbh->do( "
+                UPDATE test_results
+                SET progress = ?
+                WHERE hash_id = ?
+                  AND progress <> 100
+                ",
+                undef,
+                $progress,
+                $test_id,
+            );
         }
     }
 
@@ -261,8 +317,20 @@ sub test_results {
     my ( $self, $test_id, $new_results ) = @_;
 
     if ( $new_results ) {
-        $self->dbh->do( qq[UPDATE test_results SET progress=100, test_end_time=datetime('now'), results = ? WHERE hash_id=? AND progress < 100],
-            undef, $new_results, $test_id );
+        $self->dbh->do(
+            qq[
+            UPDATE test_results
+            SET progress = 100,
+                test_end_time = datetime(?),
+                results = ?
+            WHERE hash_id = ?
+              AND progress < 100
+            ],
+            undef,
+            _format_time( time ),
+            $new_results,
+            $test_id,
+        );
     }
 
     my $result;
@@ -348,13 +416,33 @@ sub add_batch_job {
         eval {$dbh->do( "DROP INDEX IF EXISTS test_results__progress " );};
         eval {$dbh->do( "DROP INDEX IF EXISTS test_results__domain_undelegated " );};
         
-        my $sth = $dbh->prepare( 'INSERT INTO test_results (hash_id, domain, batch_id, priority, queue, params_deterministic_hash, params) VALUES (?, ?, ?, ?, ?, ?, ?) ' );
+        my $now_string = _format_time( time );
+        my $sth = $dbh->prepare( '
+            INSERT INTO test_results (
+                hash_id,
+                domain,
+                batch_id,
+                $creation_time,
+                priority,
+                queue,
+                params_deterministic_hash,
+                params
+            ) VALUES (?,?,?,?,?,?,?,?)' );
         foreach my $domain ( @{$params->{domains}} ) {
             $test_params->{domain} = $domain;
             my $encoded_params                 = $js->encode( $test_params );
             my $test_params_deterministic_hash = md5_hex( encode_utf8( $encoded_params ) );
 
-            $sth->execute( substr(md5_hex(time().rand()), 0, 16), $test_params->{domain}, $batch_id, $priority, $queue, $test_params_deterministic_hash, $encoded_params );
+            $sth->execute(    #
+                substr( md5_hex( time() . rand() ), 0, 16 ),
+                $test_params->{domain},
+                $batch_id,
+                $now_string,
+                $priority,
+                $queue,
+                $test_params_deterministic_hash,
+                $encoded_params,
+            );
         }
         $dbh->do( "CREATE INDEX test_results__hash_id ON test_results (hash_id, creation_time)" );
         $dbh->do( "CREATE INDEX test_results__params_deterministic_hash ON test_results (params_deterministic_hash)" );
@@ -379,13 +467,13 @@ sub select_unfinished_tests {
         my $sth = $self->dbh->prepare( "
             SELECT hash_id, results, nb_retries
             FROM test_results
-            WHERE test_start_time < DATETIME('now', ?)
+            WHERE test_start_time < ?
             AND nb_retries <= ?
             AND progress > 0
             AND progress < 100
             AND queue = ?" );
         $sth->execute(    #
-            sprintf( "-%d seconds", $self->config->ZONEMASTER_max_zonemaster_execution_time ),
+            _format_time( time - $self->config->ZONEMASTER_max_zonemaster_execution_time ),
             $self->config->ZONEMASTER_maximal_number_of_retries,
             $self->config->ZONEMASTER_lock_on_queue,
         );
@@ -395,12 +483,12 @@ sub select_unfinished_tests {
         my $sth = $self->dbh->prepare( "
             SELECT hash_id, results, nb_retries
             FROM test_results
-            WHERE test_start_time < DATETIME('now', ?)
+            WHERE test_start_time < ?
             AND nb_retries <= ?
             AND progress > 0
             AND progress < 100" );
         $sth->execute(    #
-            sprintf( "-%d seconds", $self->config->ZONEMASTER_max_zonemaster_execution_time ),
+            _format_time( time - $self->config->ZONEMASTER_max_zonemaster_execution_time ),
             $self->config->ZONEMASTER_maximal_number_of_retries,
         );
         return $sth;
@@ -408,15 +496,41 @@ sub select_unfinished_tests {
 }
 
 sub process_unfinished_tests_give_up {
-     my ( $self, $result, $hash_id ) = @_;
+    my ( $self, $result, $hash_id ) = @_;
 
-     $self->dbh->do("UPDATE test_results SET progress = 100, test_end_time = DATETIME('now'), results = ? WHERE hash_id=?", undef, encode_json($result), $hash_id);
+    $self->dbh->do( "
+         UPDATE test_results
+         SET progress = 100,
+             test_end_time = DATETIME(?),
+             results = ?
+         WHERE hash_id = ?
+         ",
+        undef,
+        _format_time( time ),
+        encode_json( $result ),
+        $hash_id,
+    );
 }
 
 sub schedule_for_retry {
     my ( $self, $hash_id ) = @_;
 
-    $self->dbh->do("UPDATE test_results SET nb_retries = nb_retries + 1, progress = 0, test_start_time = DATETIME('now') WHERE hash_id=?", undef, $hash_id);
+    $self->dbh->do( "
+        UPDATE test_results
+        SET nb_retries = nb_retries + 1,
+            progress = 0,
+            test_start_time = DATETIME(?)
+        WHERE hash_id = ?
+        ",
+        undef,
+        _format_time( time ),
+        $hash_id,
+    );
+}
+
+sub _format_time {
+    my ( $time ) = @_;
+    return strftime "%Y-%m-%d %H:%M:%S", gmtime( $time );
 }
 
 no Moose;
